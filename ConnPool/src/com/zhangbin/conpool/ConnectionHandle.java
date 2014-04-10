@@ -18,382 +18,683 @@ import java.sql.Struct;
 import java.util.Map;
 import java.util.Properties;
 import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
 
 import com.zhangbin.conpool.common.exception.ConnectionClosedException;
 
 /**
  * Connection的包装类
- * 使用者必须在外部close放回连接池，如果没有close会出现内存问题
+ * 
  * @author zhangbinalan
- *
+ * 
  */
 public class ConnectionHandle implements Connection {
-	
-	//实际的数据库连接
+	// 链接的ID编号
+	private String connectionId;
+	// 链接池
+	private ConnPool pool;
+	// 链接钩子
+	private ConnectionHook hook;
+	// 实际的数据库连接
 	private Connection internalConnection;
-	//创建时间,内部connection的设置时间
+	// 创建时间,内部connection的设置时间
 	private long createTimeInMils;
-	//最近一次使用时间，上一次使用完成释放到连接池中的时间
+	// 最近一次使用时间，上一次使用完成释放到连接池中的时间
 	private long lastUsedTimeInMils;
-	//是否逻辑关闭
+	// 是否逻辑关闭
 	private boolean isLogicalClosed;
+	// 是否发生错误，专门一个线程关闭出现错误的链接
 	private boolean possibleInException;
-	//锁
+	// 锁
 	private Lock lock;
-	
+
+	public ConnectionHandle(String connectionId,ConnPool pool, ConnectionHook hook,
+			Connection internalConnection) {
+		this.connectionId=connectionId;
+		this.pool = pool;
+		this.hook = hook;
+		this.internalConnection = internalConnection;
+		this.createTimeInMils = System.currentTimeMillis();
+		this.lock = new ReentrantLock();
+	}
+
 	@Override
 	public void close() throws SQLException {
-		//链接默认自动提交
-		boolean isAutoCommit = getAutoCommit();
-		if(!isAutoCommit){
-			rollback();
-			setAutoCommit(true);
-		}
 		//
 		lock.lock();
-		try{
-			isLogicalClosed=true;
-		}finally{
+		try {
+			// 链接默认自动提交
+			boolean isAutoCommit = getAutoCommit();
+			if (!isAutoCommit) {
+				rollback();
+				setAutoCommit(true);
+			}
+
+			isLogicalClosed = true;
+
+			// 放回连接池
+			this.lastUsedTimeInMils = System.currentTimeMillis();
+			pool.releaseConnection(this);
+
+			if (this.hook != null) {
+				hook.onCheckIn(this);
+			}
+		} finally {
 			lock.unlock();
 		}
-		//放回连接池
-		
 	}
-	//内部实际关闭链接
-	public void internalClose() throws SQLException{
-		
+
+	// 内部实际关闭链接
+	public void internalClose() throws SQLException {
+
 		lock.lock();
-		try{
-			isLogicalClosed=true;
-			
-			if (internalConnection!=null) {
+		try {
+			isLogicalClosed = true;
+			if (internalConnection != null) {
 				internalConnection.close();
+				internalConnection = null;
+				
+				this.pool.destroyConnection(this);
+				if (this.hook != null) {
+					hook.onClosed(this);
+				}
+				
 			}
-			
 		} catch (SQLException e) {
 			throw makePossibleException(e);
-		} finally{
+		} finally {
 			lock.unlock();
 		}
 	}
-	
+
+	public boolean isPossibleInException() {
+		return possibleInException;
+	}
+
 	private SQLException makePossibleException(SQLException e) {
-		
-		possibleInException=true;
-		
+
+		possibleInException = true;
+		if (this.hook != null) {
+			hook.onException(this, e);
+		}
 		return e;
 	}
-	protected void checkClosed() throws SQLException{
+
+	protected void checkClosed() throws SQLException {
 		lock.lock();
-		try{
-			if(isLogicalClosed){
+		try {
+			if (isLogicalClosed) {
 				throw new ConnectionClosedException();
 			}
-		}finally{
+		} finally {
 			lock.unlock();
 		}
 	}
+
+	public long getLastUsedTimeInMils() {
+		return lastUsedTimeInMils;
+	}
+
+	public void setLastUsedTimeInMils(long lastUsedTimeInMils) {
+		this.lastUsedTimeInMils = lastUsedTimeInMils;
+	}
+
+	public long getCreateTimeInMils() {
+		return createTimeInMils;
+	}
+
+	public String getConnectionId() {
+		return connectionId;
+	}
+
 	@Override
 	public <T> T unwrap(Class<T> iface) throws SQLException {
-		// TODO Auto-generated method stub
-		return null;
+		return internalConnection.unwrap(iface);
 	}
 
 	@Override
 	public boolean isWrapperFor(Class<?> iface) throws SQLException {
-		// TODO Auto-generated method stub
-		return false;
+		return internalConnection.isWrapperFor(iface);
 	}
 
 	@Override
 	public Statement createStatement() throws SQLException {
-		// TODO Auto-generated method stub
-		return null;
+		checkClosed();
+		Statement result;
+		try {
+			result = internalConnection.createStatement();
+		} catch (SQLException e) {
+			throw makePossibleException(e);
+		}
+		return result;
 	}
 
 	@Override
 	public PreparedStatement prepareStatement(String sql) throws SQLException {
-		// TODO Auto-generated method stub
-		return null;
+		checkClosed();
+		PreparedStatement result;
+		try {
+			result = internalConnection.prepareStatement(sql);
+		} catch (SQLException e) {
+			throw makePossibleException(e);
+		}
+		return result;
 	}
 
 	@Override
 	public CallableStatement prepareCall(String sql) throws SQLException {
-		// TODO Auto-generated method stub
-		return null;
+		checkClosed();
+		CallableStatement result;
+		try {
+			result = internalConnection.prepareCall(sql);
+		} catch (SQLException e) {
+			throw makePossibleException(e);
+		}
+		return result;
 	}
 
 	@Override
 	public String nativeSQL(String sql) throws SQLException {
-		// TODO Auto-generated method stub
-		return null;
+		checkClosed();
+		String result;
+		try {
+			result = internalConnection.nativeSQL(sql);
+		} catch (SQLException e) {
+			throw makePossibleException(e);
+		}
+		return result;
 	}
 
 	@Override
 	public void setAutoCommit(boolean autoCommit) throws SQLException {
-		// TODO Auto-generated method stub
-
+		checkClosed();
+		try {
+			internalConnection.setAutoCommit(autoCommit);
+		} catch (SQLException e) {
+			throw makePossibleException(e);
+		}
 	}
 
 	@Override
 	public boolean getAutoCommit() throws SQLException {
-		// TODO Auto-generated method stub
-		return false;
+		checkClosed();
+		boolean result;
+		try {
+			result = internalConnection.getAutoCommit();
+		} catch (SQLException e) {
+			throw makePossibleException(e);
+		}
+		return result;
 	}
 
 	@Override
 	public void commit() throws SQLException {
-		// TODO Auto-generated method stub
-
+		checkClosed();
+		try {
+			internalConnection.commit();
+		} catch (SQLException e) {
+			throw makePossibleException(e);
+		}
 	}
 
 	@Override
 	public void rollback() throws SQLException {
-		// TODO Auto-generated method stub
-
+		checkClosed();
+		try {
+			internalConnection.rollback();
+		} catch (SQLException e) {
+			throw makePossibleException(e);
+		}
 	}
+
 	@Override
 	public boolean isClosed() throws SQLException {
-		// TODO Auto-generated method stub
-		return false;
+		checkClosed();
+		boolean result;
+		try {
+			result = internalConnection.isClosed();
+		} catch (SQLException e) {
+			throw makePossibleException(e);
+		}
+		return result;
 	}
 
 	@Override
 	public DatabaseMetaData getMetaData() throws SQLException {
-		// TODO Auto-generated method stub
-		return null;
+		checkClosed();
+		DatabaseMetaData result;
+		try {
+			result = internalConnection.getMetaData();
+		} catch (SQLException e) {
+			throw makePossibleException(e);
+		}
+		return result;
 	}
 
 	@Override
 	public void setReadOnly(boolean readOnly) throws SQLException {
-		// TODO Auto-generated method stub
-
+		checkClosed();
+		try {
+			internalConnection.setReadOnly(readOnly);
+		} catch (SQLException e) {
+			throw makePossibleException(e);
+		}
 	}
 
 	@Override
 	public boolean isReadOnly() throws SQLException {
-		// TODO Auto-generated method stub
-		return false;
+		checkClosed();
+		boolean result;
+		try {
+			result = internalConnection.isReadOnly();
+		} catch (SQLException e) {
+			throw makePossibleException(e);
+		}
+		return result;
 	}
 
 	@Override
 	public void setCatalog(String catalog) throws SQLException {
-		// TODO Auto-generated method stub
+		checkClosed();
+		try {
+			internalConnection.setCatalog(catalog);
+		} catch (SQLException e) {
+			throw makePossibleException(e);
+		}
 
 	}
 
 	@Override
 	public String getCatalog() throws SQLException {
-		// TODO Auto-generated method stub
-		return null;
+		checkClosed();
+		String result;
+		try {
+			result = internalConnection.getCatalog();
+		} catch (SQLException e) {
+			throw makePossibleException(e);
+		}
+		return result;
 	}
 
 	@Override
 	public void setTransactionIsolation(int level) throws SQLException {
-		// TODO Auto-generated method stub
-
+		checkClosed();
+		try {
+			internalConnection.setTransactionIsolation(level);
+		} catch (SQLException e) {
+			throw makePossibleException(e);
+		}
 	}
 
 	@Override
 	public int getTransactionIsolation() throws SQLException {
-		// TODO Auto-generated method stub
-		return 0;
+		checkClosed();
+		int result;
+		try {
+			result = internalConnection.getTransactionIsolation();
+		} catch (SQLException e) {
+			throw makePossibleException(e);
+		}
+		return result;
 	}
 
 	@Override
 	public SQLWarning getWarnings() throws SQLException {
-		// TODO Auto-generated method stub
-		return null;
+		checkClosed();
+		SQLWarning result;
+		try {
+			result = internalConnection.getWarnings();
+		} catch (SQLException e) {
+			throw makePossibleException(e);
+		}
+		return result;
 	}
 
 	@Override
 	public void clearWarnings() throws SQLException {
-		// TODO Auto-generated method stub
-
+		checkClosed();
+		try {
+			internalConnection.clearWarnings();
+		} catch (SQLException e) {
+			throw makePossibleException(e);
+		}
 	}
 
 	@Override
 	public Statement createStatement(int resultSetType, int resultSetConcurrency)
 			throws SQLException {
-		// TODO Auto-generated method stub
-		return null;
+		checkClosed();
+		Statement result;
+		try {
+			result = internalConnection.createStatement(resultSetType,
+					resultSetConcurrency);
+		} catch (SQLException e) {
+			throw makePossibleException(e);
+		}
+		return result;
 	}
 
 	@Override
 	public PreparedStatement prepareStatement(String sql, int resultSetType,
 			int resultSetConcurrency) throws SQLException {
-		// TODO Auto-generated method stub
-		return null;
+		checkClosed();
+		PreparedStatement result;
+		try {
+			result = internalConnection.prepareStatement(sql, resultSetType,
+					resultSetConcurrency);
+		} catch (SQLException e) {
+			throw makePossibleException(e);
+		}
+		return result;
 	}
 
 	@Override
 	public CallableStatement prepareCall(String sql, int resultSetType,
 			int resultSetConcurrency) throws SQLException {
-		// TODO Auto-generated method stub
-		return null;
+		checkClosed();
+		CallableStatement result;
+		try {
+			result = internalConnection.prepareCall(sql, resultSetType,
+					resultSetConcurrency);
+		} catch (SQLException e) {
+			throw makePossibleException(e);
+		}
+		return result;
 	}
 
 	@Override
 	public Map<String, Class<?>> getTypeMap() throws SQLException {
-		// TODO Auto-generated method stub
-		return null;
+		checkClosed();
+		Map<String, Class<?>> result;
+		try {
+			result = internalConnection.getTypeMap();
+		} catch (SQLException e) {
+			throw makePossibleException(e);
+		}
+		return result;
 	}
 
 	@Override
 	public void setTypeMap(Map<String, Class<?>> map) throws SQLException {
-		// TODO Auto-generated method stub
-
+		checkClosed();
+		try {
+			internalConnection.setTypeMap(map);
+		} catch (SQLException e) {
+			throw makePossibleException(e);
+		}
 	}
 
 	@Override
 	public void setHoldability(int holdability) throws SQLException {
-		// TODO Auto-generated method stub
-
+		checkClosed();
+		try {
+			internalConnection.setHoldability(holdability);
+		} catch (SQLException e) {
+			throw makePossibleException(e);
+		}
 	}
 
 	@Override
 	public int getHoldability() throws SQLException {
-		// TODO Auto-generated method stub
-		return 0;
+		checkClosed();
+		int result;
+		try {
+			result = internalConnection.getHoldability();
+		} catch (SQLException e) {
+			throw makePossibleException(e);
+		}
+		return result;
 	}
 
 	@Override
 	public Savepoint setSavepoint() throws SQLException {
-		// TODO Auto-generated method stub
-		return null;
+		checkClosed();
+		Savepoint result;
+		try {
+			result = internalConnection.setSavepoint();
+		} catch (SQLException e) {
+			throw makePossibleException(e);
+		}
+		return result;
 	}
 
 	@Override
 	public Savepoint setSavepoint(String name) throws SQLException {
-		// TODO Auto-generated method stub
-		return null;
+		checkClosed();
+		Savepoint result;
+		try {
+			result = internalConnection.setSavepoint(name);
+		} catch (SQLException e) {
+			throw makePossibleException(e);
+		}
+		return result;
 	}
 
 	@Override
 	public void rollback(Savepoint savepoint) throws SQLException {
-		// TODO Auto-generated method stub
-
+		checkClosed();
+		try {
+			internalConnection.rollback(savepoint);
+		} catch (SQLException e) {
+			throw makePossibleException(e);
+		}
 	}
 
 	@Override
 	public void releaseSavepoint(Savepoint savepoint) throws SQLException {
-		// TODO Auto-generated method stub
-
+		checkClosed();
+		try {
+			internalConnection.releaseSavepoint(savepoint);
+		} catch (SQLException e) {
+			throw makePossibleException(e);
+		}
 	}
 
 	@Override
 	public Statement createStatement(int resultSetType,
 			int resultSetConcurrency, int resultSetHoldability)
 			throws SQLException {
-		// TODO Auto-generated method stub
-		return null;
+		checkClosed();
+		Statement result;
+		try {
+			result = internalConnection.createStatement(resultSetType,
+					resultSetConcurrency, resultSetHoldability);
+		} catch (SQLException e) {
+			throw makePossibleException(e);
+		}
+		return result;
 	}
 
 	@Override
 	public PreparedStatement prepareStatement(String sql, int resultSetType,
 			int resultSetConcurrency, int resultSetHoldability)
 			throws SQLException {
-		// TODO Auto-generated method stub
-		return null;
+		checkClosed();
+		PreparedStatement result;
+		try {
+			result = internalConnection.prepareStatement(sql, resultSetType,
+					resultSetConcurrency, resultSetHoldability);
+		} catch (SQLException e) {
+			throw makePossibleException(e);
+		}
+		return result;
 	}
 
 	@Override
 	public CallableStatement prepareCall(String sql, int resultSetType,
 			int resultSetConcurrency, int resultSetHoldability)
 			throws SQLException {
-		// TODO Auto-generated method stub
-		return null;
+		checkClosed();
+		CallableStatement result;
+		try {
+			result = internalConnection.prepareCall(sql, resultSetType,
+					resultSetConcurrency, resultSetHoldability);
+		} catch (SQLException e) {
+			throw makePossibleException(e);
+		}
+		return result;
 	}
 
 	@Override
 	public PreparedStatement prepareStatement(String sql, int autoGeneratedKeys)
 			throws SQLException {
-		// TODO Auto-generated method stub
-		return null;
+		checkClosed();
+		PreparedStatement result;
+		try {
+			result = internalConnection
+					.prepareStatement(sql, autoGeneratedKeys);
+		} catch (SQLException e) {
+			throw makePossibleException(e);
+		}
+		return result;
 	}
 
 	@Override
 	public PreparedStatement prepareStatement(String sql, int[] columnIndexes)
 			throws SQLException {
-		// TODO Auto-generated method stub
-		return null;
+		checkClosed();
+		PreparedStatement result;
+		try {
+			result = internalConnection.prepareStatement(sql, columnIndexes);
+		} catch (SQLException e) {
+			throw makePossibleException(e);
+		}
+		return result;
 	}
 
 	@Override
 	public PreparedStatement prepareStatement(String sql, String[] columnNames)
 			throws SQLException {
-		// TODO Auto-generated method stub
-		return null;
+		checkClosed();
+		PreparedStatement result;
+		try {
+			result = internalConnection.prepareStatement(sql, columnNames);
+		} catch (SQLException e) {
+			throw makePossibleException(e);
+		}
+		return result;
 	}
 
 	@Override
 	public Clob createClob() throws SQLException {
-		// TODO Auto-generated method stub
-		return null;
+		checkClosed();
+		Clob result;
+		try {
+			result = internalConnection.createClob();
+		} catch (SQLException e) {
+			throw makePossibleException(e);
+		}
+		return result;
 	}
 
 	@Override
 	public Blob createBlob() throws SQLException {
-		// TODO Auto-generated method stub
-		return null;
+		checkClosed();
+		Blob result;
+		try {
+			result = internalConnection.createBlob();
+		} catch (SQLException e) {
+			throw makePossibleException(e);
+		}
+		return result;
 	}
 
 	@Override
 	public NClob createNClob() throws SQLException {
-		// TODO Auto-generated method stub
-		return null;
+		checkClosed();
+		NClob result;
+		try {
+			result = internalConnection.createNClob();
+		} catch (SQLException e) {
+			throw makePossibleException(e);
+		}
+		return result;
 	}
 
 	@Override
 	public SQLXML createSQLXML() throws SQLException {
-		// TODO Auto-generated method stub
-		return null;
+		checkClosed();
+		SQLXML result;
+		try {
+			result = internalConnection.createSQLXML();
+		} catch (SQLException e) {
+			throw makePossibleException(e);
+		}
+		return result;
 	}
 
 	@Override
 	public boolean isValid(int timeout) throws SQLException {
-		// TODO Auto-generated method stub
-		return false;
+		checkClosed();
+		boolean result;
+		try {
+			result = internalConnection.isValid(timeout);
+		} catch (SQLException e) {
+			throw makePossibleException(e);
+		}
+		return result;
 	}
 
 	@Override
 	public void setClientInfo(String name, String value)
 			throws SQLClientInfoException {
-		// TODO Auto-generated method stub
-
+		internalConnection.setClientInfo(name, value);
 	}
 
 	@Override
 	public void setClientInfo(Properties properties)
 			throws SQLClientInfoException {
-		// TODO Auto-generated method stub
-
+		internalConnection.setClientInfo(properties);
 	}
 
 	@Override
 	public String getClientInfo(String name) throws SQLException {
-		// TODO Auto-generated method stub
-		return null;
+		String result = null;
+		checkClosed();
+		try {
+			result = internalConnection.getClientInfo(name);
+		} catch (SQLException e) {
+			throw makePossibleException(e);
+		}
+		return result;
 	}
 
 	@Override
 	public Properties getClientInfo() throws SQLException {
-		// TODO Auto-generated method stub
-		return null;
+		Properties result = null;
+		checkClosed();
+		try {
+			result = internalConnection.getClientInfo();
+		} catch (SQLException e) {
+			throw makePossibleException(e);
+		}
+		return result;
 	}
 
 	@Override
 	public Array createArrayOf(String typeName, Object[] elements)
 			throws SQLException {
-		// TODO Auto-generated method stub
-		return null;
+		Array result = null;
+		checkClosed();
+		try {
+			result = internalConnection.createArrayOf(typeName, elements);
+		} catch (SQLException e) {
+			throw makePossibleException(e);
+		}
+		return result;
 	}
 
 	@Override
 	public Struct createStruct(String typeName, Object[] attributes)
 			throws SQLException {
-		// TODO Auto-generated method stub
-		return null;
+		Struct result = null;
+		checkClosed();
+		try {
+			result = internalConnection.createStruct(typeName, attributes);
+		} catch (SQLException e) {
+			throw makePossibleException(e);
+		}
+		return result;
 	}
 
 }
