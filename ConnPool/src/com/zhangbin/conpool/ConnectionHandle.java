@@ -8,6 +8,7 @@ import java.sql.Connection;
 import java.sql.DatabaseMetaData;
 import java.sql.NClob;
 import java.sql.PreparedStatement;
+import java.sql.ResultSet;
 import java.sql.SQLClientInfoException;
 import java.sql.SQLException;
 import java.sql.SQLWarning;
@@ -20,7 +21,11 @@ import java.util.Properties;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import com.zhangbin.conpool.common.exception.ConnectionClosedException;
+import com.zhangbin.conpool.utils.StringUtils;
 
 /**
  * Connection的包装类
@@ -29,6 +34,9 @@ import com.zhangbin.conpool.common.exception.ConnectionClosedException;
  * 
  */
 public class ConnectionHandle implements Connection {
+
+	private static Logger logger = LoggerFactory
+			.getLogger(ConnectionHandle.class);
 	// 链接的ID编号
 	private String connectionId;
 	// 链接池
@@ -48,14 +56,21 @@ public class ConnectionHandle implements Connection {
 	// 锁
 	private Lock lock;
 
-	public ConnectionHandle(String connectionId,ConnPool pool, ConnectionHook hook,
-			Connection internalConnection) {
-		this.connectionId=connectionId;
+	public ConnectionHandle(String connectionId, ConnPool pool,
+			ConnectionHook hook, Connection internalConnection) {
+		this.connectionId = connectionId;
 		this.pool = pool;
 		this.hook = hook;
 		this.internalConnection = internalConnection;
 		this.createTimeInMils = System.currentTimeMillis();
 		this.lock = new ReentrantLock();
+		postCreated();
+	}
+
+	private void postCreated() {
+		if (this.hook != null) {
+			hook.onCreated(this);
+		}
 	}
 
 	@Override
@@ -63,6 +78,11 @@ public class ConnectionHandle implements Connection {
 		//
 		lock.lock();
 		try {
+			if (isLogicalClosed) {
+				logger.warn("connectionhandle has been closed logical,connectionid="
+						+ connectionId);
+				return;
+			}
 			// 链接默认自动提交
 			boolean isAutoCommit = getAutoCommit();
 			if (!isAutoCommit) {
@@ -74,6 +94,7 @@ public class ConnectionHandle implements Connection {
 
 			// 放回连接池
 			this.lastUsedTimeInMils = System.currentTimeMillis();
+			//TODO 不要在遍历可用链接池中调用，会有并发修改list的问题
 			pool.releaseConnection(this);
 
 			if (this.hook != null) {
@@ -85,25 +106,33 @@ public class ConnectionHandle implements Connection {
 	}
 
 	// 内部实际关闭链接
-	public void internalClose() throws SQLException {
+	public void internalClose() {
 
 		lock.lock();
 		try {
 			isLogicalClosed = true;
 			if (internalConnection != null) {
-				internalConnection.close();
+				closeQuietly();
 				internalConnection = null;
-				
-				this.pool.destroyConnection(this);
+				// TODO 这样会有并发修改list的问题
+				// this.pool.destroyConnection(this);
 				if (this.hook != null) {
 					hook.onClosed(this);
 				}
-				
 			}
-		} catch (SQLException e) {
-			throw makePossibleException(e);
 		} finally {
 			lock.unlock();
+		}
+	}
+
+	private void closeQuietly() {
+		try {
+			internalConnection.close();
+			logger.debug("ConnectionHandle internalconnection close success,connectionid="
+					+ connectionId);
+		} catch (SQLException e) {
+			logger.error("internalconnection close occur fail,connectionid="
+					+ connectionId, e);
 		}
 	}
 
@@ -128,6 +157,43 @@ public class ConnectionHandle implements Connection {
 			}
 		} finally {
 			lock.unlock();
+		}
+	}
+
+	protected void sendCheckSQL() throws SQLException {
+
+		Statement statement = null;
+		ResultSet rs = null;
+		try {
+			String keepAliveSQL = pool.getConfig().getKeepAliveSql();
+			if (StringUtils.isEmpty(keepAliveSQL)) {
+				rs = internalConnection.getMetaData().getTables(null, null,
+						"connpool_keepalive", new String[] { "TABLE" });
+			} else {
+				statement = internalConnection.createStatement();
+				statement.execute(keepAliveSQL);
+			}
+			logger.debug("ConnectionHandle sendCheckSQL success,connectionId="
+					+ connectionId);
+		} catch (SQLException e) {
+			logger.error("ConnectionHandle sendCheckSQL fail,connectionId="
+					+ connectionId, e);
+			throw e;
+		} finally {
+			try {
+				if (statement != null) {
+					statement.close();
+				}
+			} catch (SQLException e) {
+				// ignore
+			}
+			try {
+				if (rs != null) {
+					rs.close();
+				}
+			} catch (SQLException e) {
+				// ignore
+			}
 		}
 	}
 
@@ -697,4 +763,11 @@ public class ConnectionHandle implements Connection {
 		return result;
 	}
 
+	@Override
+	public String toString() {
+		return "[ConnectionHandle,connectionId=" + connectionId
+				+ ",createTime=" + createTimeInMils + ",lastUseTime="
+				+ lastUsedTimeInMils + ",isPhysicalclosed="
+				+ (internalConnection == null ? true : false) + "]";
+	}
 }

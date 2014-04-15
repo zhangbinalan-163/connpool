@@ -5,4 +5,5 @@ public interface ConnectionHook {
 	void onCheckOut(ConnectionHandle connection);
 	void onException(ConnectionHandle connection,Exception e);
 	void onClosed(ConnectionHandle connection);
+	void onCreated(ConnectionHandle connection);
 }
